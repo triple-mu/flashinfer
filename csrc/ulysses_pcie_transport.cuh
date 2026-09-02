@@ -990,16 +990,30 @@ inline MkeyGeometry GetMkeyGeometry(int mode, int64_t batch, int64_t seq, int64_
     rows = batch * seq;
     width = (heads / world_size) * dim * element_size;
     pitch = heads * dim * element_size;
-  } else {
+  } else if (mode == 1) {
     rows = batch * (seq / world_size);
     width = heads * dim * element_size;
     pitch = heads * world_size * dim * element_size;
+  } else {
+    // Equal-length contiguous chunks: peer r owns [r * chunk, (r + 1) * chunk).
+    // Not a second mechanism -- it is this same descriptor with a single row,
+    // so MkeyPeerAddress's peer * width offset already lands on the chunk.
+    // ValidateGeometry pins the operand to [1, 1, world_size, chunk] for this
+    // mode, so one "head" is one peer's chunk and the whole buffer is one row.
+    rows = 1;
+    width = dim * element_size;
+    pitch = width;
   }
   TVM_FFI_ICHECK_LE(rows, UINT32_MAX) << "mlx5 MKey row count exceeds UINT32_MAX";
   TVM_FFI_ICHECK_LE(width, UINT32_MAX) << "mlx5 MKey width exceeds UINT32_MAX";
   TVM_FFI_ICHECK_LE(width, pitch) << "mlx5 MKey width exceeds pitch";
-  TVM_FFI_ICHECK_LE(pitch, kMaxInterleavedStride)
-      << "mlx5 MKey pitch exceeds the 65535-byte interleaved-stride limit";
+  // The 16-bit stride field only has to hold a stride. A single-row descriptor
+  // encodes no stride, so the limit does not apply to it; modes 0 and 1 always
+  // have rows > 1 for any real Ulysses shape, so their check is unchanged.
+  if (rows > 1) {
+    TVM_FFI_ICHECK_LE(pitch, kMaxInterleavedStride)
+        << "mlx5 MKey pitch exceeds the 65535-byte interleaved-stride limit";
+  }
   const int64_t skip = pitch - width;
   TVM_FFI_ICHECK_LE(skip, UINT32_MAX) << "mlx5 MKey skip exceeds UINT32_MAX";
   return {static_cast<uint32_t>(rows), static_cast<uint32_t>(width), static_cast<uint32_t>(skip),
@@ -1201,6 +1215,10 @@ inline void BindGeometry(Transport* transport, Buffer* buffer, int64_t mode, int
   buffer->element_size = element_size;
   buffer->output_bytes = output_bytes;
   if (!transport->use_rdma) return;
+  // Chunk exchange has no interleaved side at all -- both the local read and
+  // the remote write are contiguous per peer -- so it registered no MKeys and
+  // has nothing to rebind.
+  if (buffer->mode == 2) return;
   // Runs only inside exchange()'s hybrid failure envelope: the outer catch
   // must publish the group abort before quiescing partially posted UMR work,
   // so do not wrap this in RetireOnFailure.
