@@ -67,6 +67,20 @@ void FlushHybridWrites(Transport* transport) {
                 "cudaDeviceFlushGPUDirectRDMAWrites");
 }
 
+// The shape one transform turns [batch, seq, heads, dim] into.  Every caller
+// that needs it goes through here: the duplicate that used to sit in
+// allocate_ulysses_pcie_output silently gave mode 2 seq/world_size == 0.
+struct OutputGeometry {
+  int64_t seq;
+  int64_t heads;
+};
+
+inline OutputGeometry GetOutputGeometry(int64_t mode, int64_t seq, int64_t heads, int world_size) {
+  if (mode == 0) return {seq * world_size, heads / world_size};
+  if (mode == 1) return {seq / world_size, heads * world_size};
+  return {seq, heads};  // mode 2: equal-length chunks exchange in place
+}
+
 int64_t ValidateGeometry(TensorView tensor, int64_t mode, int64_t batch, int64_t seq, int64_t heads,
                          int64_t dim, int world_size, bool output, bool use_rdma) {
   CHECK_INPUT(tensor);
@@ -91,13 +105,11 @@ int64_t ValidateGeometry(TensorView tensor, int64_t mode, int64_t batch, int64_t
     TVM_FFI_ICHECK_EQ(heads, world_size) << "chunk-exchange needs one chunk per peer, got " << heads
                                          << " chunks for world size " << world_size;
   }
-  const int64_t out_seq = mode == 0 ? seq * world_size : (mode == 1 ? seq / world_size : seq);
-  const int64_t out_heads =
-      mode == 0 ? heads / world_size : (mode == 1 ? heads * world_size : heads);
+  const OutputGeometry out = GetOutputGeometry(mode, seq, heads, world_size);
   const int64_t sizes[4] = {
       batch,
-      output ? out_seq : seq,
-      output ? out_heads : heads,
+      output ? out.seq : seq,
+      output ? out.heads : heads,
       dim,
   };
   for (int axis = 0; axis < 4; ++axis) {
@@ -145,11 +157,9 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
   const int64_t dim = input.size(3);
   const int64_t input_bytes = ValidateGeometry(input, mode, batch, seq, heads, dim,
                                                transport->world_size, false, transport->use_rdma);
-  const int64_t out_seq = mode == 0 ? seq * transport->world_size : seq / transport->world_size;
-  const int64_t out_heads =
-      mode == 0 ? heads / transport->world_size : heads * transport->world_size;
+  const OutputGeometry out = GetOutputGeometry(mode, seq, heads, transport->world_size);
   const int64_t element_size = get_element_size(input);
-  const int64_t elements = batch * out_seq * out_heads * dim;
+  const int64_t elements = batch * out.seq * out.heads * dim;
   TVM_FFI_ICHECK_GE(capacity_elements, elements)
       << "declared capacity is smaller than the operand this call would produce";
   const int64_t capacity_bytes = capacity_elements * element_size;
@@ -159,7 +169,7 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
                           tvm::ffi::Shape({capacity_elements}), input.dtype(), input.device());
   // Describe the initial geometry over that storage. Null strides mean compact
   // row-major, which is what every operand on this path is.
-  int64_t view_shape[4] = {batch, out_seq, out_heads, dim};
+  int64_t view_shape[4] = {batch, out.seq, out.heads, dim};
   DLTensor view = *storage.GetDLTensorPtr();
   view.ndim = 4;
   view.shape = view_shape;
@@ -177,7 +187,7 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
   }
   fi::RegisterOutput(transport, input, TensorView(&view), mode, std::move(storage_owner),
                      std::move(landing_owner), capacity_bytes, element_size, input_bytes,
-                     batch * out_seq * out_heads * dim * element_size);
+                     batch * out.seq * out.heads * dim * element_size);
 
   // Rank-local registration record to all_gather and feed back through
   // connect_output.
